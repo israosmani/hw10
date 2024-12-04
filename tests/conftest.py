@@ -14,144 +14,157 @@ Fixtures:
 """
 
 # Standard library imports
-import datetime
 import uuid
+from datetime import datetime
 
 # Third-party imports
 import pytest
-from faker import Faker
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
-from passlib.hash import bcrypt
+from faker import Faker
 
 # Application-specific imports
 from app.main import app
-from app.database import Base
+from app.database import Base, Database
 from app.models.user_model import User, UserRole
-from app.dependencies import get_db
+from app.dependencies import get_db, get_settings
+from app.utils.security import hash_password
 from app.utils.template_manager import TemplateManager
 from app.services.email_service import EmailService
 from app.services.jwt_service import create_access_token
 
+# Instantiate Faker for generating random data
 fake = Faker()
 
-# Configure database for tests
-TEST_DB_URL = app.state.settings.database_url.replace("postgresql://", "postgresql+asyncpg://")
-engine = create_async_engine(TEST_DB_URL, echo=app.state.settings.debug)
-SessionLocal = sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+# Configuration and setup
+settings = get_settings()
+TEST_DATABASE_URL = settings.database_url.replace("postgresql://", "postgresql+asyncpg://")
+engine = create_async_engine(TEST_DATABASE_URL, echo=settings.debug)
+TestingSessionLocal = sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 
-# Utility function for password hashing
-def generate_hashed_password(password: str) -> str:
-    return bcrypt.hash(password)
-
-# Fixtures for email services
+# Fixtures
+@pytest.mark.email
 @pytest.fixture
-def email_service_fixture():
+def email_service():
+    """
+    Provides an instance of the EmailService for testing.
+    """
     return EmailService(template_manager=TemplateManager())
 
-# Database setup and teardown
 @pytest.fixture(scope="session", autouse=True)
-async def setup_test_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+def setup_database():
+    """
+    Initializes and cleans up the test database schema.
+    """
+    Database.initialize(TEST_DATABASE_URL)
     yield
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
+    Database.shutdown()
 
-# Database session for each test
 @pytest.fixture(scope="function")
-async def db_session_fixture():
-    async with SessionLocal() as session:
+async def async_client(db_session):
+    """
+    Provides an async HTTP client for testing FastAPI endpoints.
+    """
+    async with AsyncClient(app=app, base_url="http://testserver") as client:
+        app.dependency_overrides[get_db] = lambda: db_session
+        yield client
+        app.dependency_overrides.clear()
+
+@pytest.fixture(scope="function")
+async def db_session():
+    """
+    Provides a scoped async database session for each test.
+    """
+    async with TestingSessionLocal() as session:
         yield session
 
-# HTTP client for testing FastAPI routes
 @pytest.fixture(scope="function")
-async def test_client(db_session_fixture):
-    app.dependency_overrides[get_db] = lambda: db_session_fixture
-    async with AsyncClient(app=app, base_url="http://testserver") as client:
-        yield client
-    app.dependency_overrides.clear()
-
-# Generate test users
-@pytest.fixture(scope="function")
-async def create_user(db_session_fixture, email_verified=False, is_locked=False, role=UserRole.AUTHENTICATED):
+async def create_test_user(db_session, is_verified=False, is_locked=False, role=UserRole.AUTHENTICATED):
+    """
+    Helper to create a test user with customizable attributes.
+    """
     user = User(
         nickname=fake.user_name(),
         first_name=fake.first_name(),
         last_name=fake.last_name(),
         email=fake.email(),
-        hashed_password=generate_hashed_password("Password$123"),
-        email_verified=email_verified,
+        hashed_password=hash_password("SecurePass123!"),
+        role=role,
+        email_verified=is_verified,
         is_locked=is_locked,
-        role=role
     )
-    db_session_fixture.add(user)
-    await db_session_fixture.commit()
+    db_session.add(user)
+    await db_session.commit()
     return user
 
-# Specific user types
-@pytest.fixture(scope="function")
-async def locked_user_fixture(db_session_fixture):
-    return await create_user(db_session_fixture, is_locked=True)
-
-@pytest.fixture(scope="function")
-async def regular_user_fixture(db_session_fixture):
-    return await create_user(db_session_fixture)
-
-@pytest.fixture(scope="function")
-async def admin_user_fixture(db_session_fixture):
-    return await create_user(db_session_fixture, role=UserRole.ADMIN)
-
-@pytest.fixture(scope="function")
-async def verified_user_fixture(db_session_fixture):
-    return await create_user(db_session_fixture, email_verified=True)
-
-@pytest.fixture(scope="function")
-async def manager_user_fixture(db_session_fixture):
-    return await create_user(db_session_fixture, role=UserRole.MANAGER, email_verified=True)
-
-# Generate JWT tokens
-@pytest.fixture(scope="function")
-async def generate_token(db_session_fixture, create_user):
-    async def _generate_token(user_role=UserRole.AUTHENTICATED):
-        user = await create_user(db_session_fixture, role=user_role)
-        token = create_access_token(data={"sub": user.email, "role": user.role.name})
-        return token
-    return _generate_token
-
-# Generate multiple users of the same role
-@pytest.fixture(scope="function")
-async def create_multiple_users(db_session_fixture):
-    async def _create_multiple_users(role, count=50):
-        users = []
-        for _ in range(count):
-            user = User(
-                nickname=fake.user_name(),
-                first_name=fake.first_name(),
-                last_name=fake.last_name(),
-                email=fake.email(),
-                hashed_password=generate_hashed_password("Password123"),
-                role=role
-            )
-            db_session_fixture.add(user)
-            users.append(user)
-        await db_session_fixture.commit()
-        return users
-    return _create_multiple_users
-
-# Static test data
 @pytest.fixture
-def user_creation_data():
-    return {"username": "john_doe", "password": "SecurePassword123!"}
+async def regular_user(db_session):
+    """
+    Provides a regular test user.
+    """
+    return await create_test_user(db_session)
 
 @pytest.fixture
-def user_update_data_fixture():
-    return {
-        "email": "john.doe.updated@example.com",
-        "bio": "Experienced software developer with a knack for APIs.",
-    }
+async def admin_user(db_session):
+    """
+    Provides an admin test user.
+    """
+    return await create_test_user(db_session, role=UserRole.ADMIN)
 
 @pytest.fixture
-def login_data_fixture():
-    return {"username": "john_doe", "password": "SecurePassword123!"}
+async def locked_user(db_session):
+    """
+    Provides a locked test user.
+    """
+    return await create_test_user(db_session, is_locked=True)
+
+@pytest.fixture
+async def verified_user(db_session):
+    """
+    Provides a verified test user.
+    """
+    return await create_test_user(db_session, is_verified=True)
+
+@pytest.fixture(scope="function")
+async def user_token(regular_user):
+    """
+    Generates a token for a regular test user.
+    """
+    return create_access_token(data={"sub": regular_user.email, "role": regular_user.role.name})
+
+@pytest.fixture(scope="function")
+async def admin_token(admin_user):
+    """
+    Generates a token for an admin test user.
+    """
+    return create_access_token(data={"sub": admin_user.email, "role": admin_user.role.name})
+
+@pytest.fixture(scope="function")
+async def generate_multiple_users(db_session, count=50):
+    """
+    Creates multiple users with the same role for testing.
+    """
+    users = []
+    for _ in range(count):
+        user = User(
+            nickname=fake.user_name(),
+            first_name=fake.first_name(),
+            last_name=fake.last_name(),
+            email=fake.email(),
+            hashed_password=hash_password(fake.password()),
+            role=UserRole.AUTHENTICATED,
+            email_verified=False,
+            is_locked=False,
+        )
+        db_session.add(user)
+        users.append(user)
+    await db_session.commit()
+    return users
+
+@pytest.fixture
+async def manager_user(db_session):
+    """
+    Provides a manager test user.
+    """
+    return await create_te
